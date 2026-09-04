@@ -32,7 +32,7 @@ const DEEPSEEK_REASONING_EFFORT = 'high';
 // IMPORTANT: unlike other models, thinking is ALWAYS ON for Kimi K3 - it cannot
 // be disabled. This only controls how DEEP the reasoning goes. 'low' is closest
 // to a "fast" mode, but expect it to still be slower than non-thinking models.
-const KIMI_K3_REASONING_EFFORT = 'high';
+const KIMI_K3_REASONING_EFFORT = 'max';
 
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
