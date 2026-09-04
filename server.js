@@ -15,16 +15,24 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = true ; // Set to true to show reasoning with <think> tags
+const SHOW_REASONING = true; // Set to true to show reasoning with <think> tags
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = true ; // Set to true to enable chat_template_kwargs thinking parameter
+// 🔥 THINKING MODE TOGGLE - Enables thinking for GENERIC thinking-capable models
+// (e.g. qwen3-next-thinking). Does NOT control DeepSeek V4 or Kimi K3 - see below,
+// those use their own dedicated toggles since they need different payload shapes.
+const ENABLE_THINKING_MODE = true;
 
 // 🔥 DEEPSEEK V4 REASONING EFFORT - 'none' | 'high' | 'max'
 // none = fastest, no extended reasoning (best for snappy roleplay replies)
 // high = balanced reasoning (default recommended)
 // max  = deepest reasoning, slowest & most tokens (best for hard logic/coding, not RP)
-const DEEPSEEK_REASONING_EFFORT = 'max';
+const DEEPSEEK_REASONING_EFFORT = 'high';
+
+// 🔥 KIMI K3 REASONING EFFORT - 'low' | 'high' | 'max'
+// IMPORTANT: unlike other models, thinking is ALWAYS ON for Kimi K3 - it cannot
+// be disabled. This only controls how DEEP the reasoning goes. 'low' is closest
+// to a "fast" mode, but expect it to still be slower than non-thinking models.
+const KIMI_K3_REASONING_EFFORT = 'max';
 
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
@@ -44,16 +52,17 @@ const MODEL_MAPPING = {
   'deepseek-v4-flash-0731': 'deepseek-ai/deepseek-v4-flash-0731',
   'deepseek-v4-pro-0813': 'deepseek-ai/deepseek-v4-pro-0813',
   'kimi-k3': 'moonshotai/kimi-k3'
-
 };
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+  res.json({
+    status: 'ok',
+    service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
+    thinking_mode: ENABLE_THINKING_MODE,
+    deepseek_v4_reasoning_effort: DEEPSEEK_REASONING_EFFORT,
+    kimi_k3_reasoning_effort: KIMI_K3_REASONING_EFFORT
   });
 });
 
@@ -65,18 +74,54 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
+
   res.json({
     object: 'list',
     data: models
   });
 });
 
+// Helper: build the correct reasoning/thinking params for a given resolved NIM model.
+// Different model families expect different payload shapes, so this branches per family
+// instead of applying one generic toggle to everything.
+function buildReasoningParams(nimModel) {
+  const isDeepseekV4 = nimModel.includes('deepseek-v4');
+  const isKimiK3 = nimModel.includes('kimi-k3');
+
+  if (isDeepseekV4) {
+    if (DEEPSEEK_REASONING_EFFORT === 'none') {
+      return {}; // No extra params, fastest mode
+    }
+    // DeepSeek V4 on NIM needs both fields set at the payload root to
+    // reliably trigger reasoning - some deployments hang without both.
+    return {
+      chat_template_kwargs: { enable_thinking: true, thinking: true },
+      reasoning_effort: DEEPSEEK_REASONING_EFFORT // 'high' or 'max'
+    };
+  }
+
+  if (isKimiK3) {
+    // Thinking can't be turned off for K3 - only the effort level is configurable,
+    // sent as a plain top-level field (no chat_template_kwargs wrapper needed).
+    return {
+      reasoning_effort: KIMI_K3_REASONING_EFFORT // 'low' | 'high' | 'max'
+    };
+  }
+
+  if (ENABLE_THINKING_MODE) {
+    return {
+      chat_template_kwargs: { thinking: true }
+    };
+  }
+
+  return {};
+}
+
 // Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
-    
+    const { model, messages, temperature, max_tokens, stream, top_p, top_k } = req.body;
+
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
@@ -94,7 +139,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         });
       } catch (e) {}
-      
+
       if (!nimModel) {
         const modelLower = model.toLowerCase();
         if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
@@ -106,17 +151,19 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
     }
-    
+
     // Transform OpenAI request to NIM format
-const nimRequest = {
-  model: nimModel,
-  messages: messages,
-  temperature: temperature || 0.6,
-  max_tokens: max_tokens || 9024,
-  ...(ENABLE_THINKING_MODE && { chat_template_kwargs: { thinking: true } }),
-  stream: stream || false
-};
-    
+    const nimRequest = {
+      model: nimModel,
+      messages: messages,
+      temperature: temperature || 0.6,
+      max_tokens: max_tokens || 9024,
+      ...(top_p !== undefined && { top_p }),
+      ...(top_k !== undefined && { top_k }),
+      ...buildReasoningParams(nimModel),
+      stream: stream || false
+    };
+
     // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
@@ -125,51 +172,51 @@ const nimRequest = {
       },
       responseType: stream ? 'stream' : 'json'
     });
-    
+
     if (stream) {
       // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      
+
       let buffer = '';
       let reasoningStarted = false;
-      
+
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-        
+
         lines.forEach(line => {
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
               res.write(line + '\n');
               return;
             }
-            
+
             try {
               const data = JSON.parse(line.slice(6));
               if (data.choices?.[0]?.delta) {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
-                
+
                 if (SHOW_REASONING) {
                   let combinedContent = '';
-                  
+
                   if (reasoning && !reasoningStarted) {
                     combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
                   } else if (reasoning) {
                     combinedContent = reasoning;
                   }
-                  
+
                   if (content && reasoningStarted) {
                     combinedContent += '</think>\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
                   }
-                  
+
                   if (combinedContent) {
                     data.choices[0].delta.content = combinedContent;
                     delete data.choices[0].delta.reasoning_content;
@@ -190,7 +237,7 @@ const nimRequest = {
           }
         });
       });
-      
+
       response.data.on('end', () => res.end());
       response.data.on('error', (err) => {
         console.error('Stream error:', err);
@@ -205,11 +252,11 @@ const nimRequest = {
         model: model,
         choices: response.data.choices.map(choice => {
           let fullContent = choice.message?.content || '';
-          
+
           if (SHOW_REASONING && choice.message?.reasoning_content) {
             fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
           }
-          
+
           return {
             index: choice.index,
             message: {
@@ -225,12 +272,11 @@ const nimRequest = {
           total_tokens: 0
         }
       };
-      
+
       res.json(openaiResponse);
     }
-    
 
-} catch (error) {
+  } catch (error) {
     // Log the FULL error details to Railway logs
     console.error('Proxy error:', error.message);
     if (error.response) {
@@ -267,5 +313,7 @@ app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Thinking mode (generic): ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`DeepSeek V4 reasoning effort: ${DEEPSEEK_REASONING_EFFORT}`);
+  console.log(`Kimi K3 reasoning effort: ${KIMI_K3_REASONING_EFFORT}`);
 });
